@@ -1,3 +1,5 @@
+import { deflateRawSync } from 'node:zlib'
+
 export interface TextOptions {
   align?: 'left' | 'center' | 'right'
   bold?: boolean
@@ -10,14 +12,8 @@ export interface TextOptions {
   size?: number
 }
 
-export interface TableOptions {
-  colWidths?: number[]
-}
-
-export interface ImageOptions {
-  width: number
-  height: number
-}
+export interface TableOptions { colWidths?: number[] }
+export interface ImageOptions { width: number; height: number }
 
 export interface TextRun {
   text: string
@@ -47,6 +43,8 @@ export interface DOCXBuilder {
 
 export interface ODTBuilder {
   content(fn: (ctx: DocContext) => void): ODTBuilder
+  header(fn: (ctx: DocContext) => void): ODTBuilder
+  footer(fn: (ctx: DocContext) => void): ODTBuilder
   build(): Uint8Array
 }
 
@@ -365,14 +363,26 @@ const parseList = (state: LineState): [BlockToken, LineState] | null => {
 
   const indent = getIndent(line)
   const [items, next] = parseItems(state, indent)
-  const ordered = isOrdered
-  return [ordered ? { tag: 'ol', items } : { tag: 'ul', items }, next]
+  return [isOrdered ? { tag: 'ol', items } : { tag: 'ul', items }, next]
 }
+
+const isSpecialLine = (line: string): boolean =>
+  /^#{1,6}\s/.test(line) || /^(-{3,}|\*{3,}|_{3,})$/.test(line.trim()) ||
+  line.startsWith('>') || line.startsWith('```') || /^\|.+\|$/.test(line) ||
+  /^(\s*)[-*]\s/.test(line) || /^(\s*)\d+\.\s/.test(line)
 
 const parseParagraph = (state: LineState): [BlockToken, LineState] | null => {
   const line = peek(state)
   if (!line || line.trim() === '') return null
-  return [{ tag: 'p', content: parseInlineTokens(line) }, advance(state)]
+  const lines: string[] = [line]
+  let cur = advance(state)
+  while (!isDone(cur)) {
+    const l = peek(cur)
+    if (!l || l.trim() === '' || isSpecialLine(l)) break
+    lines.push(l)
+    cur = advance(cur)
+  }
+  return [{ tag: 'p', content: parseInlineTokens(lines.join(' ')) }, cur]
 }
 
 const parseBlocks = (state: LineState): BlockToken[] => {
@@ -430,94 +440,76 @@ const COURIER = 'Courier New'
 const OOXML = 'http://schemas.openxmlformats.org/'
 const OD = 'urn:oasis:names:tc:opendocument:xmlns:'
 const NS = {
-  w: OOXML + 'wordprocessingml/2006/main',
-  r: OOXML + 'officeDocument/2006/relationships',
-  rel: OOXML + 'package/2006/relationships',
-  ct: OOXML + 'package/2006/content-types',
-  wp: OOXML + 'drawingml/2006/wordprocessingDrawing',
-  a: OOXML + 'drawingml/2006/main',
-  pic: OOXML + 'drawingml/2006/picture',
-  manifest: OD + 'manifest:1.0',
-  office: OD + 'office:1.0',
-  text: OD + 'text:1.0',
-  style: OD + 'style:1.0',
-  fo: OD + 'xsl-fo-compatible:1.0',
-  table: OD + 'table:1.0',
+  w: OOXML + 'wordprocessingml/2006/main', r: OOXML + 'officeDocument/2006/relationships',
+  rel: OOXML + 'package/2006/relationships', ct: OOXML + 'package/2006/content-types',
+  wp: OOXML + 'drawingml/2006/wordprocessingDrawing', a: OOXML + 'drawingml/2006/main',
+  pic: OOXML + 'drawingml/2006/picture', manifest: OD + 'manifest:1.0',
+  office: OD + 'office:1.0', text: OD + 'text:1.0', style: OD + 'style:1.0',
+  fo: OD + 'xsl-fo-compatible:1.0', table: OD + 'table:1.0',
+  draw: OD + 'drawing:1.0', svg: OD + 'svg-compatible:1.0',
   xlink: 'http://www.w3.org/1999/xlink',
 }
 
 type ZipEntry = { name: string; data: Uint8Array }
 
-const concatBytes = (arrays: Uint8Array[]): Uint8Array => {
-  const total = arrays.reduce((sum, a) => sum + a.length, 0)
-  const result = new Uint8Array(total)
-  arrays.reduce((offset, arr) => { result.set(arr, offset); return offset + arr.length }, 0)
-  return result
-}
-
 const createZip = (files: ZipEntry[]): Uint8Array => {
   const enc = new TextEncoder()
+  const prepared = files.map(f => {
+    const name = enc.encode(f.name)
+    const crcVal = crc32(f.data)
+    const compressed = deflateRawSync(f.data)
+    const useDeflate = compressed.length < f.data.length
+    return { name, data: f.data, compressed: useDeflate ? compressed : f.data, crc: crcVal, method: useDeflate ? 8 : 0 }
+  })
 
-  const makeLocalHeader = (name: Uint8Array, data: Uint8Array, crc: number): Uint8Array => {
-    const header = new Uint8Array(30 + name.length)
-    const view = new DataView(header.buffer)
-    view.setUint32(0, 0x04034b50, true)
-    view.setUint16(4, 20, true)
-    view.setUint16(26, name.length, true)
-    view.setUint32(14, crc, true)
-    view.setUint32(18, data.length, true)
-    view.setUint32(22, data.length, true)
-    header.set(name, 30)
-    return header
+  let totalSize = 0
+  const offsets: number[] = []
+  for (const p of prepared) {
+    offsets.push(totalSize)
+    totalSize += 30 + p.name.length + p.compressed.length
+  }
+  const centralStart = totalSize
+  for (const p of prepared) totalSize += 46 + p.name.length
+  totalSize += 22
+
+  const buf = new Uint8Array(totalSize)
+  const view = new DataView(buf.buffer)
+  let pos = 0
+
+  for (let i = 0; i < prepared.length; i++) {
+    const p = prepared[i]
+    view.setUint32(pos, 0x04034b50, true); view.setUint16(pos + 4, 20, true)
+    view.setUint16(pos + 8, p.method, true)
+    view.setUint32(pos + 14, p.crc, true)
+    view.setUint32(pos + 18, p.compressed.length, true)
+    view.setUint32(pos + 22, p.data.length, true)
+    view.setUint16(pos + 26, p.name.length, true)
+    buf.set(p.name, pos + 30)
+    buf.set(p.compressed, pos + 30 + p.name.length)
+    pos += 30 + p.name.length + p.compressed.length
   }
 
-  const makeCentralHeader = (name: Uint8Array, data: Uint8Array, crc: number, offset: number): Uint8Array => {
-    const central = new Uint8Array(46 + name.length)
-    const view = new DataView(central.buffer)
-    view.setUint32(0, 0x02014b50, true)
-    view.setUint16(4, 20, true)
-    view.setUint16(6, 20, true)
-    view.setUint32(16, crc, true)
-    view.setUint32(20, data.length, true)
-    view.setUint32(24, data.length, true)
-    view.setUint16(28, name.length, true)
-    view.setUint32(42, offset, true)
-    central.set(name, 46)
-    return central
+  for (let i = 0; i < prepared.length; i++) {
+    const p = prepared[i]
+    view.setUint32(pos, 0x02014b50, true); view.setUint16(pos + 4, 20, true); view.setUint16(pos + 6, 20, true)
+    view.setUint16(pos + 10, p.method, true)
+    view.setUint32(pos + 16, p.crc, true)
+    view.setUint32(pos + 20, p.compressed.length, true)
+    view.setUint32(pos + 24, p.data.length, true)
+    view.setUint16(pos + 28, p.name.length, true)
+    view.setUint32(pos + 42, offsets[i], true)
+    buf.set(p.name, pos + 46)
+    pos += 46 + p.name.length
   }
 
-  const makeEndRecord = (count: number, centralSize: number, centralOffset: number): Uint8Array => {
-    const end = new Uint8Array(22)
-    const view = new DataView(end.buffer)
-    view.setUint32(0, 0x06054b50, true)
-    view.setUint16(8, count, true)
-    view.setUint16(10, count, true)
-    view.setUint32(12, centralSize, true)
-    view.setUint32(16, centralOffset, true)
-    return end
-  }
+  const centralSize = pos - centralStart
+  view.setUint32(pos, 0x06054b50, true)
+  view.setUint16(pos + 8, prepared.length, true)
+  view.setUint16(pos + 10, prepared.length, true)
+  view.setUint32(pos + 12, centralSize, true)
+  view.setUint32(pos + 16, centralStart, true)
 
-  type EntryInfo = { name: Uint8Array; data: Uint8Array; crc: number; offset: number }
-
-  const { entries, localParts, offset } = files.reduce<{ entries: EntryInfo[]; localParts: Uint8Array[]; offset: number }>(
-    (acc, file) => {
-      const name = enc.encode(file.name)
-      const crc = crc32(file.data)
-      const header = makeLocalHeader(name, file.data, crc)
-      return {
-        entries: [...acc.entries, { name, data: file.data, crc, offset: acc.offset }],
-        localParts: [...acc.localParts, header, file.data],
-        offset: acc.offset + header.length + file.data.length
-      }
-    },
-    { entries: [], localParts: [], offset: 0 }
-  )
-
-  const centralParts = entries.map(e => makeCentralHeader(e.name, e.data, e.crc, e.offset))
-  const centralSize = centralParts.reduce((sum, p) => sum + p.length, 0)
-  const endRecord = makeEndRecord(entries.length, centralSize, offset)
-
-  return concatBytes([...localParts, ...centralParts, endRecord])
+  return buf
 }
 
 interface BuildContext {
@@ -604,8 +596,7 @@ const elementToDocx = (el: DocElement): string => {
       return `<w:p><w:pPr><w:jc w:val="${getAlignment(el.opts?.align)}"/></w:pPr><w:r>${buildDocxRunProps(el.opts)}<w:t>${escapeXml(el.text)}</w:t></w:r></w:p>`
     case 'text':
       return `<w:p><w:pPr><w:jc w:val="${getAlignment(el.opts?.align)}"/></w:pPr><w:r>${buildDocxRunProps(el.opts, el.size)}<w:t>${escapeXml(el.text)}</w:t></w:r></w:p>`
-    case 'lineBreak':
-      return '<w:p/>'
+    case 'lineBreak': return '<w:p/>'
     case 'horizontalRule':
       return '<w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="auto"/></w:pBdr></w:pPr></w:p>'
     case 'list':
@@ -618,16 +609,14 @@ const elementToDocx = (el: DocElement): string => {
     case 'link':
       return `<w:p><w:hyperlink r:id="${el.rId}"><w:r>${buildDocxRunProps({ ...el.opts, color: el.opts?.color || '0563C1', underline: true })}<w:t>${escapeXml(el.text)}</w:t></w:r></w:hyperlink></w:p>`
     case 'image': {
-      const cx = Math.round(el.opts.width * 914400)
-      const cy = Math.round(el.opts.height * 914400)
+      const cx = Math.round(el.opts.width * 914400), cy = Math.round(el.opts.height * 914400)
       return `<w:p><w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0" xmlns:wp="${NS.wp}"><wp:extent cx="${cx}" cy="${cy}"/><wp:docPr id="${el.docPrId}" name="Image${el.docPrId}"/><a:graphic xmlns:a="${NS.a}"><a:graphicData uri="${NS.pic}"><pic:pic xmlns:pic="${NS.pic}"><pic:nvPicPr><pic:cNvPr id="${el.docPrId}" name="Image${el.docPrId}"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="${el.rId}" xmlns:r="${NS.r}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>`
     }
     case 'pageNumber':
       return '<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> PAGE </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>1</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>'
     case 'richParagraph':
       return `<w:p><w:pPr><w:jc w:val="${getAlignment(el.align)}"/></w:pPr>${buildDocxRuns(el.runs)}</w:p>`
-    case 'richList':
-      return buildDocxListItems(el.items, el.ordered, 0)
+    case 'richList': return buildDocxListItems(el.items, el.ordered, 0)
     case 'richTable': {
       const grid = el.opts?.colWidths ? `<w:tblGrid>${el.opts.colWidths.map(w => `<w:gridCol w:w="${w}"/>`).join('')}</w:tblGrid>` : ''
       const rows = el.rows.map(row => `<w:tr>${row.map((cell, i) => `<w:tc>${el.opts?.colWidths?.[i] ? `<w:tcPr><w:tcW w:w="${el.opts.colWidths[i]}" w:type="dxa"/></w:tcPr>` : ''}<w:p>${buildDocxRuns(cell)}</w:p></w:tc>`).join('')}</w:tr>`).join('')
@@ -636,9 +625,7 @@ const elementToDocx = (el: DocElement): string => {
     case 'blockquote': {
       const quoteStyle = '<w:pPr><w:ind w:left="720"/><w:pBdr><w:left w:val="single" w:sz="18" w:space="4" w:color="CCCCCC"/></w:pBdr></w:pPr>'
       return el.elements.map(child => {
-        if (child.type === 'richParagraph') {
-          return `<w:p>${quoteStyle}${buildDocxRuns(child.runs)}</w:p>`
-        }
+        if (child.type === 'richParagraph') return `<w:p>${quoteStyle}${buildDocxRuns(child.runs)}</w:p>`
         return elementToDocx(child)
       }).join('')
     }
@@ -651,12 +638,7 @@ const buildDocxBody = (elements: DocElement[]): string => elements.map(elementTo
 
 const generateDocxDocument = (elements: DocElement[], headerRId?: string, footerRId?: string): string => {
   const body = buildDocxBody(elements)
-  const sectPr = [
-    '<w:sectPr>',
-    headerRId ? `<w:headerReference w:type="default" r:id="${headerRId}"/>` : '',
-    footerRId ? `<w:footerReference w:type="default" r:id="${footerRId}"/>` : '',
-    '<w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720"/></w:sectPr>'
-  ].join('')
+  const sectPr = `<w:sectPr>${headerRId ? `<w:headerReference w:type="default" r:id="${headerRId}"/>` : ''}${footerRId ? `<w:footerReference w:type="default" r:id="${footerRId}"/>` : ''}<w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720"/></w:sectPr>`
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:document xmlns:w="${NS.w}" xmlns:r="${NS.r}">\n<w:body>\n${body}\n${sectPr}\n</w:body>\n</w:document>`
 }
 
@@ -666,80 +648,48 @@ const generateDocxHeader = (elements: DocElement[], hasLinksOrImages: boolean): 
 const generateDocxFooter = (elements: DocElement[], hasLinksOrImages: boolean): string =>
   `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:ftr xmlns:w="${NS.w}"${hasLinksOrImages ? ` xmlns:r="${NS.r}"` : ''}>\n${buildDocxBody(elements)}\n</w:ftr>`
 
-const generateDocxStyles = (): string => `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:styles xmlns:w="${NS.w}">
-<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:sz w:val="22"/></w:rPr></w:rPrDefault></w:docDefaults>
-<w:style w:type="paragraph" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
-<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="Heading 1"/><w:basedOn w:val="Normal"/><w:rPr><w:b/><w:sz w:val="48"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="Heading 2"/><w:basedOn w:val="Normal"/><w:rPr><w:b/><w:sz w:val="36"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Heading3"><w:name w:val="Heading 3"/><w:basedOn w:val="Normal"/><w:rPr><w:b/><w:sz w:val="28"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Heading4"><w:name w:val="Heading 4"/><w:basedOn w:val="Normal"/><w:rPr><w:b/><w:sz w:val="24"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Heading5"><w:name w:val="Heading 5"/><w:basedOn w:val="Normal"/><w:rPr><w:b/><w:sz w:val="20"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Heading6"><w:name w:val="Heading 6"/><w:basedOn w:val="Normal"/><w:rPr><w:b/><w:sz w:val="18"/></w:rPr></w:style>
-</w:styles>`
-
-const generateDocxNumbering = (): string => `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:numbering xmlns:w="${NS.w}">
-<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="•"/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr></w:lvl></w:abstractNum>
-<w:abstractNum w:abstractNumId="1"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr></w:lvl></w:abstractNum>
-<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
-<w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>
-</w:numbering>`
-
-const generateDocxContentTypes = (hasLists: boolean, hasHeader: boolean, hasFooter: boolean, imageExts: string[]): string => {
-  const defaults = [
-    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
-    '<Default Extension="xml" ContentType="application/xml"/>',
-    ...Array.from(new Set(imageExts)).map(ext => {
-      const mime = ext === 'jpeg' ? 'image/jpeg' : ext === 'gif' ? 'image/gif' : 'image/png'
-      return `<Default Extension="${ext}" ContentType="${mime}"/>`
-    })
-  ]
-  const overrides = [
-    '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>',
-    '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>',
-    ...(hasLists ? ['<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>'] : []),
-    ...(hasHeader ? ['<Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>'] : []),
-    ...(hasFooter ? ['<Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/>'] : [])
-  ]
-  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Types xmlns="${NS.ct}">\n${[...defaults, ...overrides].join('\n')}\n</Types>`
+const generateDocxStyles = (): string => {
+  const h = [1, 2, 3, 4, 5, 6].map(i => `<w:style w:type="paragraph" w:styleId="Heading${i}"><w:name w:val="Heading ${i}"/><w:basedOn w:val="Normal"/><w:rPr><w:b/><w:sz w:val="${HEADING_SIZES[i as 1|2|3|4|5|6]}"/></w:rPr></w:style>`).join('')
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="${NS.w}"><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:sz w:val="22"/></w:rPr></w:rPrDefault></w:docDefaults><w:style w:type="paragraph" w:styleId="Normal"><w:name w:val="Normal"/></w:style>${h}</w:styles>`
 }
 
-const generateDocxRels = (
-  hasLists: boolean,
-  hasHeader: boolean,
-  hasFooter: boolean,
-  hyperlinks: { url: string; rId: string }[],
-  images: { rId: string; ext: string }[],
-  imageOffset: number
-): string => {
-  const rels = [
-    `<Relationship Id="rId1" Type="${NS.r}/styles" Target="styles.xml"/>`,
+const BULLET_CHARS = ['•', '◦', '▪', '•', '◦']
+const generateDocxNumbering = (): string => {
+  const bulletLevels = Array.from({ length: 5 }, (_, i) =>
+    `<w:lvl w:ilvl="${i}"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="${BULLET_CHARS[i]}"/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="${720 * (i + 1)}" w:hanging="360"/></w:pPr></w:lvl>`
+  ).join('')
+  const decimalLevels = Array.from({ length: 5 }, (_, i) =>
+    `<w:lvl w:ilvl="${i}"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%${i + 1}."/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="${720 * (i + 1)}" w:hanging="360"/></w:pPr></w:lvl>`
+  ).join('')
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:numbering xmlns:w="${NS.w}"><w:abstractNum w:abstractNumId="0">${bulletLevels}</w:abstractNum><w:abstractNum w:abstractNumId="1">${decimalLevels}</w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num><w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num></w:numbering>`
+}
+
+const generateDocxContentTypes = (hasLists: boolean, hasHeader: boolean, hasFooter: boolean, imageExts: string[]): string => {
+  const imgDefaults = Array.from(new Set(imageExts)).map(ext => `<Default Extension="${ext}" ContentType="${ext === 'jpeg' ? 'image/jpeg' : ext === 'gif' ? 'image/gif' : 'image/png'}"/>`).join('')
+  const overrides = `<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>${hasLists ? '<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>' : ''}${hasHeader ? '<Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>' : ''}${hasFooter ? '<Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/>' : ''}`
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="${NS.ct}"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>${imgDefaults}${overrides}</Types>`
+}
+
+const generateDocxRels = (hasLists: boolean, hasHeader: boolean, hasFooter: boolean, hyperlinks: { url: string; rId: string }[], images: { rId: string; ext: string }[], imageOffset: number): string => {
+  const rels = [`<Relationship Id="rId1" Type="${NS.r}/styles" Target="styles.xml"/>`,
     ...(hasLists ? [`<Relationship Id="rId2" Type="${NS.r}/numbering" Target="numbering.xml"/>`] : []),
     ...(hasHeader ? [`<Relationship Id="rIdHeader" Type="${NS.r}/header" Target="header1.xml"/>`] : []),
     ...(hasFooter ? [`<Relationship Id="rIdFooter" Type="${NS.r}/footer" Target="footer1.xml"/>`] : []),
-    ...hyperlinks.map(link => `<Relationship Id="${link.rId}" Type="${NS.r}/hyperlink" Target="${escapeXml(link.url)}" TargetMode="External"/>`),
+    ...hyperlinks.map(l => `<Relationship Id="${l.rId}" Type="${NS.r}/hyperlink" Target="${escapeXml(l.url)}" TargetMode="External"/>`),
     ...images.map((img, i) => `<Relationship Id="${img.rId}" Type="${NS.r}/image" Target="media/image${imageOffset + i + 1}.${img.ext}"/>`)
-  ]
-  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="${NS.rel}">\n${rels.join('\n')}\n</Relationships>`
+  ].join('')
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="${NS.rel}">${rels}</Relationships>`
 }
 
-const generatePartRels = (
-  hyperlinks: { url: string; rId: string }[],
-  images: { rId: string; ext: string }[],
-  imageOffset: number
-): string => {
+const generatePartRels = (hyperlinks: { url: string; rId: string }[], images: { rId: string; ext: string }[], imageOffset: number): string => {
   const rels = [
-    ...hyperlinks.map(link => `<Relationship Id="${link.rId}" Type="${NS.r}/hyperlink" Target="${escapeXml(link.url)}" TargetMode="External"/>`),
+    ...hyperlinks.map(l => `<Relationship Id="${l.rId}" Type="${NS.r}/hyperlink" Target="${escapeXml(l.url)}" TargetMode="External"/>`),
     ...images.map((img, i) => `<Relationship Id="${img.rId}" Type="${NS.r}/image" Target="media/image${imageOffset + i + 1}.${img.ext}"/>`)
-  ]
-  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="${NS.rel}">\n${rels.join('\n')}\n</Relationships>`
+  ].join('')
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="${NS.rel}">${rels}</Relationships>`
 }
 
-const DOCX_RELS = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="${NS.rel}">
-<Relationship Id="rId1" Type="${NS.r}/officeDocument" Target="word/document.xml"/>
-</Relationships>`
+const DOCX_RELS = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="${NS.rel}"><Relationship Id="rId1" Type="${NS.r}/officeDocument" Target="word/document.xml"/></Relationships>`
 
 /**
  * Create a new DOCX document
@@ -749,37 +699,24 @@ export function docx(): DOCXBuilder {
   const mainCtx: BuildContext = { elements: [], hyperlinks: [], images: [], nextRId: 10, nextDocPrId: docPrIdCounter }
   const headerCtx: BuildContext = { elements: [], hyperlinks: [], images: [], nextRId: 100, nextDocPrId: docPrIdCounter }
   const footerCtx: BuildContext = { elements: [], hyperlinks: [], images: [], nextRId: 200, nextDocPrId: docPrIdCounter }
-  let hasHeader = false
-  let hasFooter = false
+  let hasHeader = false, hasFooter = false
 
   const builder: DOCXBuilder = {
-    content(fn) {
-      fn(createContext(mainCtx))
-      return builder
-    },
-    header(fn) {
-      hasHeader = true
-      fn(createContext(headerCtx))
-      return builder
-    },
-    footer(fn) {
-      hasFooter = true
-      fn(createContext(footerCtx))
-      return builder
-    },
+    content(fn) { fn(createContext(mainCtx)); return builder },
+    header(fn) { hasHeader = true; fn(createContext(headerCtx)); return builder },
+    footer(fn) { hasFooter = true; fn(createContext(footerCtx)); return builder },
     build() {
       const enc = new TextEncoder()
-      const hasLists = mainCtx.elements.some(el => el.type === 'list')
+      const hasLists = mainCtx.elements.some(el => el.type === 'list' || el.type === 'richList')
       const allImages = [...mainCtx.images, ...headerCtx.images, ...footerCtx.images]
       const imageExts = allImages.map(img => img.ext)
-      const mainImageOffset = 0
       const headerImageOffset = mainCtx.images.length
       const footerImageOffset = mainCtx.images.length + headerCtx.images.length
 
       const files: ZipEntry[] = [
         { name: '[Content_Types].xml', data: enc.encode(generateDocxContentTypes(hasLists, hasHeader, hasFooter, imageExts)) },
         { name: '_rels/.rels', data: enc.encode(DOCX_RELS) },
-        { name: 'word/_rels/document.xml.rels', data: enc.encode(generateDocxRels(hasLists, hasHeader, hasFooter, mainCtx.hyperlinks, mainCtx.images, mainImageOffset)) },
+        { name: 'word/_rels/document.xml.rels', data: enc.encode(generateDocxRels(hasLists, hasHeader, hasFooter, mainCtx.hyperlinks, mainCtx.images, 0)) },
         { name: 'word/document.xml', data: enc.encode(generateDocxDocument(mainCtx.elements, hasHeader ? 'rIdHeader' : undefined, hasFooter ? 'rIdFooter' : undefined)) },
         { name: 'word/styles.xml', data: enc.encode(generateDocxStyles()) },
         ...(hasLists ? [{ name: 'word/numbering.xml', data: enc.encode(generateDocxNumbering()) }] : []),
@@ -801,31 +738,16 @@ export function docx(): DOCXBuilder {
 
 const ODT_MIMETYPE = 'application/vnd.oasis.opendocument.text'
 
-const ODT_MANIFEST = `<?xml version="1.0" encoding="UTF-8"?>
-<manifest:manifest xmlns:manifest="${NS.manifest}" manifest:version="1.2">
-<manifest:file-entry manifest:full-path="/" manifest:media-type="application/vnd.oasis.opendocument.text"/>
-<manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/>
-<manifest:file-entry manifest:full-path="styles.xml" manifest:media-type="text/xml"/>
-</manifest:manifest>`
-
-const ODT_STYLES = `<?xml version="1.0" encoding="UTF-8"?>
-<office:document-styles xmlns:office="${NS.office}" xmlns:style="${NS.style}" xmlns:fo="${NS.fo}" office:version="1.2">
-<office:styles>
-<style:style style:name="Standard" style:family="paragraph"/>
-<style:style style:name="Heading1" style:family="paragraph"><style:text-properties fo:font-size="24pt" fo:font-weight="bold"/></style:style>
-<style:style style:name="Heading2" style:family="paragraph"><style:text-properties fo:font-size="18pt" fo:font-weight="bold"/></style:style>
-<style:style style:name="Heading3" style:family="paragraph"><style:text-properties fo:font-size="14pt" fo:font-weight="bold"/></style:style>
-<style:style style:name="Heading4" style:family="paragraph"><style:text-properties fo:font-size="12pt" fo:font-weight="bold"/></style:style>
-<style:style style:name="Heading5" style:family="paragraph"><style:text-properties fo:font-size="10pt" fo:font-weight="bold"/></style:style>
-<style:style style:name="Heading6" style:family="paragraph"><style:text-properties fo:font-size="9pt" fo:font-weight="bold"/></style:style>
-</office:styles>
-</office:document-styles>`
+const generateOdtManifest = (images: { ext: string }[]): string => {
+  const imgEntries = images.map((img, i) => `<manifest:file-entry manifest:full-path="Pictures/image${i + 1}.${img.ext}" manifest:media-type="${img.ext === 'jpeg' ? 'image/jpeg' : img.ext === 'gif' ? 'image/gif' : 'image/png'}"/>`).join('')
+  return `<?xml version="1.0" encoding="UTF-8"?><manifest:manifest xmlns:manifest="${NS.manifest}" manifest:version="1.2"><manifest:file-entry manifest:full-path="/" manifest:media-type="application/vnd.oasis.opendocument.text"/><manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="styles.xml" manifest:media-type="text/xml"/>${imgEntries}</manifest:manifest>`
+}
 
 type OdtStyleAcc = { styles: string[]; counter: number }
 
-const buildOdtStyle = (name: string, opts?: TextOptions, size?: number): string => {
+const buildOdtTextProps = (opts?: TextOptions, size?: number): string => {
   const font = opts?.code ? COURIER : opts?.font
-  const textProps = [
+  return [
     font ? ` style:font-name="${font}"` : '',
     size || opts?.size ? ` fo:font-size="${size || opts?.size}pt"` : '',
     opts?.bold ? ' fo:font-weight="bold"' : '',
@@ -835,23 +757,12 @@ const buildOdtStyle = (name: string, opts?: TextOptions, size?: number): string 
     opts?.code ? ' fo:background-color="#E8E8E8"' : '',
     opts?.color ? ` fo:color="${opts.color}"` : ''
   ].join('')
-  const pProps = opts?.align ? `<style:paragraph-properties fo:text-align="${opts.align}"/>` : ''
-  return `<style:style style:name="${name}" style:family="paragraph">${pProps}<style:text-properties${textProps}/></style:style>`
 }
 
-const buildOdtTextStyle = (name: string, opts?: TextOptions): string => {
-  const font = opts?.code ? COURIER : opts?.font
-  const textProps = [
-    font ? ` style:font-name="${font}"` : '',
-    opts?.size ? ` fo:font-size="${opts.size}pt"` : '',
-    opts?.bold ? ' fo:font-weight="bold"' : '',
-    opts?.italic ? ' fo:font-style="italic"' : '',
-    opts?.underline ? ' style:text-underline-style="solid"' : '',
-    opts?.strikethrough ? ' style:text-line-through-style="solid"' : '',
-    opts?.code ? ' fo:background-color="#E8E8E8"' : '',
-    opts?.color ? ` fo:color="${opts.color}"` : ''
-  ].join('')
-  return `<style:style style:name="${name}" style:family="text"><style:text-properties${textProps}/></style:style>`
+const buildOdtStyle = (name: string, family: 'paragraph' | 'text', opts?: TextOptions, size?: number): string => {
+  const textProps = buildOdtTextProps(opts, size)
+  const pProps = family === 'paragraph' && opts?.align ? `<style:paragraph-properties fo:text-align="${opts.align}"/>` : ''
+  return `<style:style style:name="${name}" style:family="${family}">${pProps}<style:text-properties${textProps}/></style:style>`
 }
 
 const needsTextStyle = (opts?: TextOptions): boolean =>
@@ -861,7 +772,7 @@ const buildOdtRuns = (runs: TextRun[], acc: OdtStyleAcc): string =>
   runs.map(run => {
     if (needsTextStyle(run.opts)) {
       const styleName = `T${++acc.counter}`
-      acc.styles.push(buildOdtTextStyle(styleName, run.opts))
+      acc.styles.push(buildOdtStyle(styleName, 'text', run.opts))
       return `<text:span text:style-name="${styleName}">${escapeXml(run.text)}</text:span>`
     }
     return escapeXml(run.text)
@@ -874,84 +785,97 @@ const buildOdtList = (items: ListItem[], ordered: boolean, acc: OdtStyleAcc): st
   return `<text:list text:style-name="${ordered ? 'Numbering_20_1' : 'List_20_1'}">${listItems}</text:list>`
 }
 
-const elementToOdt = (el: DocElement, acc: OdtStyleAcc): string => {
+const elementToOdt = (el: DocElement, acc: OdtStyleAcc, imageOffset: number): string => {
   switch (el.type) {
     case 'heading':
       return `<text:h text:style-name="Heading${el.level}" text:outline-level="${el.level}">${escapeXml(el.text)}</text:h>`
     case 'paragraph': {
       if (el.opts?.bold || el.opts?.italic || el.opts?.color || el.opts?.align || el.opts?.font || el.opts?.underline) {
-        const styleName = `P${++acc.counter}`
-        acc.styles.push(buildOdtStyle(styleName, el.opts))
-        return `<text:p text:style-name="${styleName}">${escapeXml(el.text)}</text:p>`
+        const sn = `P${++acc.counter}`
+        acc.styles.push(buildOdtStyle(sn, 'paragraph', el.opts))
+        return `<text:p text:style-name="${sn}">${escapeXml(el.text)}</text:p>`
       }
       return `<text:p text:style-name="Standard">${escapeXml(el.text)}</text:p>`
     }
     case 'text': {
-      const styleName = `P${++acc.counter}`
-      acc.styles.push(buildOdtStyle(styleName, el.opts, el.size))
-      return `<text:p text:style-name="${styleName}">${escapeXml(el.text)}</text:p>`
+      const sn = `P${++acc.counter}`
+      acc.styles.push(buildOdtStyle(sn, 'paragraph', el.opts, el.size))
+      return `<text:p text:style-name="${sn}">${escapeXml(el.text)}</text:p>`
     }
-    case 'lineBreak':
-      return '<text:p text:style-name="Standard"/>'
-    case 'horizontalRule':
-      return '<text:p text:style-name="Standard">────────────────────────────────────────</text:p>'
+    case 'lineBreak': return '<text:p text:style-name="Standard"/>'
+    case 'horizontalRule': return '<text:p text:style-name="Standard">────────────────────────────────────────</text:p>'
     case 'list':
       return `<text:list text:style-name="${el.ordered ? 'Numbering_20_1' : 'List_20_1'}">${el.items.map(item => `<text:list-item><text:p text:style-name="Standard">${escapeXml(item)}</text:p></text:list-item>`).join('')}</text:list>`
     case 'table':
       return `<table:table xmlns:table="${NS.table}">${el.rows.map(row => `<table:table-row>${row.map(cell => `<table:table-cell><text:p>${escapeXml(cell)}</text:p></table:table-cell>`).join('')}</table:table-row>`).join('')}</table:table>`
     case 'link':
       return `<text:p><text:a xlink:href="${escapeXml(el.url)}" xmlns:xlink="${NS.xlink}">${escapeXml(el.text)}</text:a></text:p>`
+    case 'image': {
+      const idx = imageOffset + 1
+      const wCm = (el.opts.width * 2.54).toFixed(3), hCm = (el.opts.height * 2.54).toFixed(3)
+      return `<text:p><draw:frame draw:name="Image${idx}" svg:width="${wCm}cm" svg:height="${hCm}cm" xmlns:draw="${NS.draw}" xmlns:svg="${NS.svg}"><draw:image xlink:href="Pictures/image${idx}.${detectImageType(el.data)}" xmlns:xlink="${NS.xlink}"/></draw:frame></text:p>`
+    }
+    case 'pageNumber':
+      return '<text:p><text:page-number text:select-page="current"/></text:p>'
     case 'richParagraph':
       return `<text:p text:style-name="Standard">${buildOdtRuns(el.runs, acc)}</text:p>`
-    case 'richList':
-      return buildOdtList(el.items, el.ordered, acc)
+    case 'richList': return buildOdtList(el.items, el.ordered, acc)
     case 'richTable':
       return `<table:table xmlns:table="${NS.table}">${el.rows.map(row => `<table:table-row>${row.map(cell => `<table:table-cell><text:p>${buildOdtRuns(cell, acc)}</text:p></table:table-cell>`).join('')}</table:table-row>`).join('')}</table:table>`
-    case 'blockquote':
-      return el.elements.map(child => elementToOdt(child, acc)).join('')
+    case 'blockquote': return el.elements.map(child => elementToOdt(child, acc, imageOffset)).join('')
     case 'codeBlock': {
-      const styleName = `P${++acc.counter}`
-      acc.styles.push(`<style:style style:name="${styleName}" style:family="paragraph"><style:text-properties style:font-name="${COURIER}" fo:background-color="#F5F5F5"/></style:style>`)
-      return el.code.split('\n').map(line => `<text:p text:style-name="${styleName}">${escapeXml(line)}</text:p>`).join('')
+      const sn = `P${++acc.counter}`
+      acc.styles.push(`<style:style style:name="${sn}" style:family="paragraph"><style:text-properties style:font-name="${COURIER}" fo:background-color="#F5F5F5"/></style:style>`)
+      return el.code.split('\n').map(line => `<text:p text:style-name="${sn}">${escapeXml(line)}</text:p>`).join('')
     }
-    case 'image':
-    case 'pageNumber':
-      return ''
   }
 }
 
-const generateOdtContent = (elements: DocElement[]): string => {
+const generateOdtContent = (elements: DocElement[], imageOffset = 0): string => {
   const acc: OdtStyleAcc = { styles: [], counter: 0 }
-  const body = elements.map(el => elementToOdt(el, acc)).join('')
+  const body = elements.map(el => elementToOdt(el, acc, imageOffset)).join('')
   const autoStyles = acc.styles.length > 0 ? `<office:automatic-styles>${acc.styles.join('')}</office:automatic-styles>` : ''
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<office:document-content xmlns:office="${NS.office}" xmlns:text="${NS.text}" xmlns:style="${NS.style}" xmlns:fo="${NS.fo}" office:version="1.2">
-${autoStyles}
-<office:body>
-<office:text>
-${body}
-</office:text>
-</office:body>
-</office:document-content>`
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<office:document-content xmlns:office="${NS.office}" xmlns:text="${NS.text}" xmlns:style="${NS.style}" xmlns:fo="${NS.fo}" office:version="1.2">\n${autoStyles}\n<office:body>\n<office:text>\n${body}\n</office:text>\n</office:body>\n</office:document-content>`
+}
+
+const generateOdtStyles = (headerElements?: DocElement[], footerElements?: DocElement[]): string => {
+  const headings = [1, 2, 3, 4, 5, 6].map(i => {
+    const sizes = { 1: '24pt', 2: '18pt', 3: '14pt', 4: '12pt', 5: '10pt', 6: '9pt' } as Record<number, string>
+    return `<style:style style:name="Heading${i}" style:family="paragraph"><style:text-properties fo:font-size="${sizes[i]}" fo:font-weight="bold"/></style:style>`
+  }).join('')
+  const hasMaster = headerElements || footerElements
+  let masterStyles = ''
+  if (hasMaster) {
+    const acc: OdtStyleAcc = { styles: [], counter: 1000 }
+    const hdr = headerElements ? `<style:header>${headerElements.map(el => elementToOdt(el, acc, 0)).join('')}</style:header>` : ''
+    const ftr = footerElements ? `<style:footer>${footerElements.map(el => elementToOdt(el, acc, 0)).join('')}</style:footer>` : ''
+    masterStyles = `<office:master-styles><style:master-page style:name="Standard" style:page-layout-name="pm1">${hdr}${ftr}</style:master-page></office:master-styles>`
+  }
+  return `<?xml version="1.0" encoding="UTF-8"?><office:document-styles xmlns:office="${NS.office}" xmlns:style="${NS.style}" xmlns:fo="${NS.fo}" xmlns:text="${NS.text}" office:version="1.2"><office:styles><style:style style:name="Standard" style:family="paragraph"/>${headings}</office:styles>${masterStyles}</office:document-styles>`
 }
 
 /**
  * Create a new ODT document
  */
 export function odt(): ODTBuilder {
-  const ctx: BuildContext = { elements: [], hyperlinks: [], images: [], nextRId: 1, nextDocPrId: { value: 1 } }
+  const docPrIdCounter = { value: 1 }
+  const ctx: BuildContext = { elements: [], hyperlinks: [], images: [], nextRId: 1, nextDocPrId: docPrIdCounter }
+  const headerCtx: BuildContext = { elements: [], hyperlinks: [], images: [], nextRId: 100, nextDocPrId: docPrIdCounter }
+  const footerCtx: BuildContext = { elements: [], hyperlinks: [], images: [], nextRId: 200, nextDocPrId: docPrIdCounter }
+  let hasHeader = false, hasFooter = false
   const builder: ODTBuilder = {
-    content(fn) {
-      fn(createContext(ctx))
-      return builder
-    },
+    content(fn) { fn(createContext(ctx)); return builder },
+    header(fn) { hasHeader = true; fn(createContext(headerCtx)); return builder },
+    footer(fn) { hasFooter = true; fn(createContext(footerCtx)); return builder },
     build() {
       const enc = new TextEncoder()
+      const allImages = [...ctx.images, ...headerCtx.images, ...footerCtx.images]
       return createZip([
         { name: 'mimetype', data: enc.encode(ODT_MIMETYPE) },
-        { name: 'META-INF/manifest.xml', data: enc.encode(ODT_MANIFEST) },
+        { name: 'META-INF/manifest.xml', data: enc.encode(generateOdtManifest(allImages)) },
         { name: 'content.xml', data: enc.encode(generateOdtContent(ctx.elements)) },
-        { name: 'styles.xml', data: enc.encode(ODT_STYLES) }
+        { name: 'styles.xml', data: enc.encode(generateOdtStyles(hasHeader ? headerCtx.elements : undefined, hasFooter ? footerCtx.elements : undefined)) },
+        ...allImages.map((img, i) => ({ name: `Pictures/image${i + 1}.${img.ext}`, data: img.data }))
       ])
     }
   }
@@ -981,9 +905,9 @@ export function markdownToOdt(md: string): Uint8Array {
   const enc = new TextEncoder()
   return createZip([
     { name: 'mimetype', data: enc.encode(ODT_MIMETYPE) },
-    { name: 'META-INF/manifest.xml', data: enc.encode(ODT_MANIFEST) },
+    { name: 'META-INF/manifest.xml', data: enc.encode(generateOdtManifest([])) },
     { name: 'content.xml', data: enc.encode(generateOdtContent(parseMarkdownToElements(md))) },
-    { name: 'styles.xml', data: enc.encode(ODT_STYLES) }
+    { name: 'styles.xml', data: enc.encode(generateOdtStyles()) }
   ])
 }
 
