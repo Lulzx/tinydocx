@@ -12,25 +12,27 @@ npm install tinydocx
 
 |  | tinydocx | docx |
 | --- | --- | --- |
-| **Size (gzip)** | 7.7 KB | 108.6 KB |
+| **Size (gzip)** | 8.1 KB | 108.6 KB |
 | **Dependencies** | 0 | 5 |
 
-**~14x smaller.** Everything you need: text, tables, lists, images, links, headers/footers.
+**~13x smaller.** Everything you need: text, tables, lists, images, links, headers/footers. DEFLATE-compressed output.
 
 ### Features
 
 | Feature | Description |
 | --- | --- |
 | **Text** | Any size, bold/italic/underline, hex colors, custom fonts |
-| **Paragraphs** | Alignment (left/center/right) |
+| **Paragraphs** | Alignment (left/center/right), multi-line joining |
 | **Headings** | H1–H6 |
-| **Lists** | Bullet and numbered |
+| **Lists** | Bullet and numbered, multi-level (5 levels), nested |
 | **Tables** | With borders and column widths |
 | **Hyperlinks** | External links |
-| **Images** | PNG, JPEG, GIF |
-| **Headers/Footers** | With page numbers |
+| **Images** | PNG, JPEG, GIF, WebP — DOCX and ODT |
+| **Headers/Footers** | With page numbers — DOCX and ODT |
+| **Page Numbers** | DOCX and ODT |
 | **Markdown** | Convert to DOCX/ODT |
-| **ODT** | OpenDocument support |
+| **ODT** | Full feature parity with DOCX |
+| **Compression** | DEFLATE (ZIP method 8), memory-optimized |
 
 ---
 
@@ -57,9 +59,12 @@ writeFileSync('output.docx', doc.build())
 import { odt } from 'tinydocx'
 
 const doc = odt()
+doc.header((ctx) => ctx.paragraph('Company Name', { bold: true }))
+doc.footer((ctx) => ctx.pageNumber())
 doc.content((ctx) => {
   ctx.heading('Hello World', 1)
   ctx.paragraph('Same API, different format.')
+  ctx.image(readFileSync('logo.png'), { width: 2, height: 1 })
 })
 
 writeFileSync('output.odt', doc.build())
@@ -72,7 +77,7 @@ writeFileSync('output.odt', doc.build())
 ```typescript
 import { docx, odt, markdownToDocx, markdownToOdt } from 'tinydocx'
 
-const doc = docx()
+const doc = docx() // or odt() — same API
 
 doc.content((ctx) => {
   ctx.heading(str, level)
@@ -90,7 +95,7 @@ doc.content((ctx) => {
 doc.header((ctx) => { ... })
 doc.footer((ctx) => { ... })
 
-doc.build()
+doc.build() // returns Uint8Array (DEFLATE-compressed ZIP)
 ```
 
 ### TextOptions
@@ -204,6 +209,7 @@ writeFileSync('output.odt', markdownToOdt(md))
 | Code blocks | ` ``` ` |
 | Blockquotes | `> text` |
 | Horizontal rule | `---` or `***` or `___` |
+| Multi-line paragraphs | Consecutive lines joined automatically |
 
 ---
 
@@ -244,26 +250,18 @@ writeFileSync('invoice.docx', doc.build())
 
 ## How it works
 
-DOCX files are ZIP archives with XML:
+DOCX and ODT files are ZIP archives containing XML. tinydocx generates these directly using DEFLATE compression (`node:zlib`) with a memory-optimized single-pass buffer allocation.
 
 ```
-[Content_Types].xml
-_rels/.rels
-word/document.xml
-word/styles.xml
-word/numbering.xml
+DOCX:                       ODT:
+[Content_Types].xml         mimetype
+_rels/.rels                 META-INF/manifest.xml
+word/document.xml           content.xml
+word/styles.xml             styles.xml
+word/numbering.xml          Pictures/
 word/header1.xml
 word/footer1.xml
 word/media/
-```
-
-ODT files:
-
-```
-mimetype
-META-INF/manifest.xml
-content.xml
-styles.xml
 ```
 
 ---
