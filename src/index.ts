@@ -21,6 +21,11 @@ export interface TextRun {
   link?: string
 }
 
+interface RenderRun extends TextRun {
+  rId?: string
+  image?: { src: string; alt: string; docPrId?: number }
+}
+
 export interface DocContext {
   heading(str: string, level: 1 | 2 | 3 | 4 | 5 | 6): void
   paragraph(str: string, opts?: TextOptions): void
@@ -49,21 +54,21 @@ export interface ODTBuilder {
 }
 
 interface ListItem {
-  runs: TextRun[]
+  runs: RenderRun[]
   children?: { items: ListItem[]; ordered: boolean }
 }
 
 type DocElement =
-  | { type: 'heading'; text: string; level: 1 | 2 | 3 | 4 | 5 | 6 }
+  | { type: 'heading'; text: string; level: 1 | 2 | 3 | 4 | 5 | 6; runs?: RenderRun[] }
   | { type: 'paragraph'; text: string; opts?: TextOptions }
-  | { type: 'richParagraph'; runs: TextRun[]; align?: 'left' | 'center' | 'right' }
+  | { type: 'richParagraph'; runs: RenderRun[]; align?: 'left' | 'center' | 'right' }
   | { type: 'text'; text: string; size: number; opts?: TextOptions }
   | { type: 'lineBreak' }
   | { type: 'horizontalRule' }
   | { type: 'list'; items: string[]; ordered: boolean }
   | { type: 'richList'; items: ListItem[]; ordered: boolean }
   | { type: 'table'; rows: string[][]; opts?: TableOptions }
-  | { type: 'richTable'; rows: TextRun[][][]; opts?: TableOptions }
+  | { type: 'richTable'; rows: RenderRun[][][]; opts?: TableOptions }
   | { type: 'link'; text: string; url: string; opts?: TextOptions; rId: string }
   | { type: 'image'; data: Uint8Array; opts: ImageOptions; rId: string; docPrId: number }
   | { type: 'blockquote'; elements: DocElement[] }
@@ -234,8 +239,8 @@ const mergeTextTokens = (tokens: InlineToken[]): InlineToken[] => {
   return result
 }
 
-const tokensToRuns = (tokens: InlineToken[], inherited: TextOptions = {}): TextRun[] =>
-  mergeTextTokens(tokens).flatMap((t): TextRun[] => {
+const tokensToRuns = (tokens: InlineToken[], inherited: TextOptions = {}): RenderRun[] =>
+  mergeTextTokens(tokens).flatMap((t): RenderRun[] => {
     const hasOpts = Object.keys(inherited).length > 0
     switch (t.tag) {
       case 'text': return [{ text: t.content, opts: hasOpts ? { ...inherited } : undefined }]
@@ -244,7 +249,7 @@ const tokensToRuns = (tokens: InlineToken[], inherited: TextOptions = {}): TextR
       case 'strike': return tokensToRuns(t.children, { ...inherited, strikethrough: true })
       case 'code': return [{ text: t.content, opts: { ...inherited, code: true } }]
       case 'link': return tokensToRuns(t.children, { ...inherited, color: '#0563C1', underline: true }).map(r => ({ ...r, link: t.href }))
-      case 'image': return []
+      case 'image': return [{ text: t.alt, image: { src: t.src, alt: t.alt } }]
     }
   })
 
@@ -410,7 +415,7 @@ const listNodeToListItem = (node: ListNodeItem): ListItem => ({
 
 const blockToElement = (b: BlockToken): DocElement[] => {
   switch (b.tag) {
-    case 'h': return [{ type: 'heading', text: tokensToPlainText(b.content), level: b.level }]
+    case 'h': return [{ type: 'heading', text: tokensToPlainText(b.content), level: b.level, runs: tokensToRuns(b.content) }]
     case 'p': return [{ type: 'richParagraph', runs: tokensToRuns(b.content) }]
     case 'pre': return [{ type: 'codeBlock', code: b.code, language: b.lang }]
     case 'hr': return [{ type: 'horizontalRule' }]
@@ -450,7 +455,7 @@ const NS = {
   xlink: 'http://www.w3.org/1999/xlink',
 }
 
-type ZipEntry = { name: string; data: Uint8Array }
+type ZipEntry = { name: string; data: Uint8Array; store?: boolean }
 
 const createZip = (files: ZipEntry[]): Uint8Array => {
   const enc = new TextEncoder()
@@ -458,7 +463,7 @@ const createZip = (files: ZipEntry[]): Uint8Array => {
     const name = enc.encode(f.name)
     const crcVal = crc32(f.data)
     const compressed = deflateRawSync(f.data)
-    const useDeflate = compressed.length < f.data.length
+    const useDeflate = !f.store && compressed.length < f.data.length
     return { name, data: f.data, compressed: useDeflate ? compressed : f.data, crc: crcVal, method: useDeflate ? 8 : 0 }
   })
 
@@ -530,6 +535,9 @@ const detectImageType = (data: Uint8Array): string => {
   return 'png'
 }
 
+const imageMimeType = (ext: string): string =>
+  ext === 'jpeg' ? 'image/jpeg' : ext === 'gif' ? 'image/gif' : ext === 'webp' ? 'image/webp' : 'image/png'
+
 const createContext = (ctx: BuildContext): DocContext => ({
   heading: (str, level) => { ctx.elements.push({ type: 'heading', text: str, level }) },
   paragraph: (str, opts) => { ctx.elements.push({ type: 'paragraph', text: str, opts }) },
@@ -571,10 +579,55 @@ const buildDocxRunProps = (opts?: TextOptions, size?: number): string => {
 const getAlignment = (align?: string): string =>
   align === 'center' ? 'center' : align === 'right' ? 'right' : align === 'justify' ? 'both' : 'left'
 
-const parseInline = (text: string): TextRun[] => tokensToRuns(parseInlineTokens(text))
+const parseInline = (text: string): RenderRun[] => tokensToRuns(parseInlineTokens(text))
 
-const buildDocxRuns = (runs: TextRun[]): string =>
-  runs.map(run => `<w:r>${buildDocxRunProps(run.opts)}<w:t>${escapeXml(run.text)}</w:t></w:r>`).join('')
+const visitRuns = (elements: DocElement[], fn: (run: RenderRun) => void): void => {
+  const visitItems = (items: ListItem[]): void => items.forEach(item => {
+    item.runs.forEach(fn)
+    if (item.children) visitItems(item.children.items)
+  })
+  elements.forEach(el => {
+    if (el.type === 'heading' && el.runs) el.runs.forEach(fn)
+    else if (el.type === 'richParagraph') el.runs.forEach(fn)
+    else if (el.type === 'richList') visitItems(el.items)
+    else if (el.type === 'richTable') el.rows.forEach(row => row.forEach(cell => cell.forEach(fn)))
+    else if (el.type === 'blockquote') visitRuns(el.elements, fn)
+  })
+}
+
+const prepareMarkdownRelationships = (elements: DocElement[]): {
+  hyperlinks: { url: string; rId: string }[]
+  images: { url: string; rId: string }[]
+} => {
+  const hyperlinks: { url: string; rId: string }[] = []
+  const images: { url: string; rId: string }[] = []
+  let nextRId = 10, nextDocPrId = 1
+  visitRuns(elements, run => {
+    if (run.link) {
+      run.rId = `rId${nextRId++}`
+      hyperlinks.push({ url: run.link, rId: run.rId })
+    } else if (run.image) {
+      run.rId = `rId${nextRId++}`
+      run.image.docPrId = nextDocPrId++
+      images.push({ url: run.image.src, rId: run.rId })
+    }
+  })
+  return { hyperlinks, images }
+}
+
+const buildDocxExternalImage = (run: RenderRun): string => {
+  const cx = 914400, cy = 914400
+  const id = run.image?.docPrId ?? 1
+  const name = escapeXml(run.image?.alt || `Image${id}`)
+  return `<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0" xmlns:wp="${NS.wp}"><wp:extent cx="${cx}" cy="${cy}"/><wp:docPr id="${id}" name="${name}"/><a:graphic xmlns:a="${NS.a}"><a:graphicData uri="${NS.pic}"><pic:pic xmlns:pic="${NS.pic}"><pic:nvPicPr><pic:cNvPr id="${id}" name="${name}"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:link="${run.rId}" xmlns:r="${NS.r}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>`
+}
+
+const buildDocxRuns = (runs: RenderRun[]): string =>
+  runs.map(run => {
+    if (run.image && run.rId) return buildDocxExternalImage(run)
+    const xml = `<w:r>${buildDocxRunProps(run.opts)}<w:t>${escapeXml(run.text)}</w:t></w:r>`
+    return run.link && run.rId ? `<w:hyperlink r:id="${run.rId}">${xml}</w:hyperlink>` : xml
+  }).join('')
 
 const buildDocxListItems = (items: ListItem[], ordered: boolean, level: number): string =>
   items.flatMap(item => [
@@ -590,7 +643,10 @@ const elementToDocx = (el: DocElement): string => {
   switch (el.type) {
     case 'heading': {
       const sz = HEADING_SIZES[el.level]
-      return `<w:p><w:pPr><w:pStyle w:val="Heading${el.level}"/></w:pPr><w:r><w:rPr><w:b/><w:sz w:val="${sz}"/><w:szCs w:val="${sz}"/></w:rPr><w:t>${escapeXml(el.text)}</w:t></w:r></w:p>`
+      const content = el.runs
+        ? buildDocxRuns(el.runs.map(run => ({ ...run, opts: { ...run.opts, bold: true, size: sz / 2 } })))
+        : `<w:r><w:rPr><w:b/><w:sz w:val="${sz}"/><w:szCs w:val="${sz}"/></w:rPr><w:t>${escapeXml(el.text)}</w:t></w:r>`
+      return `<w:p><w:pPr><w:pStyle w:val="Heading${el.level}"/></w:pPr>${content}</w:p>`
     }
     case 'paragraph':
       return `<w:p><w:pPr><w:jc w:val="${getAlignment(el.opts?.align)}"/></w:pPr><w:r>${buildDocxRunProps(el.opts)}<w:t>${escapeXml(el.text)}</w:t></w:r></w:p>`
@@ -665,18 +721,19 @@ const generateDocxNumbering = (): string => {
 }
 
 const generateDocxContentTypes = (hasLists: boolean, hasHeader: boolean, hasFooter: boolean, imageExts: string[]): string => {
-  const imgDefaults = Array.from(new Set(imageExts)).map(ext => `<Default Extension="${ext}" ContentType="${ext === 'jpeg' ? 'image/jpeg' : ext === 'gif' ? 'image/gif' : 'image/png'}"/>`).join('')
+  const imgDefaults = Array.from(new Set(imageExts)).map(ext => `<Default Extension="${ext}" ContentType="${imageMimeType(ext)}"/>`).join('')
   const overrides = `<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>${hasLists ? '<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>' : ''}${hasHeader ? '<Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>' : ''}${hasFooter ? '<Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/>' : ''}`
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="${NS.ct}"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>${imgDefaults}${overrides}</Types>`
 }
 
-const generateDocxRels = (hasLists: boolean, hasHeader: boolean, hasFooter: boolean, hyperlinks: { url: string; rId: string }[], images: { rId: string; ext: string }[], imageOffset: number): string => {
+const generateDocxRels = (hasLists: boolean, hasHeader: boolean, hasFooter: boolean, hyperlinks: { url: string; rId: string }[], images: { rId: string; ext: string }[], imageOffset: number, externalImages: { url: string; rId: string }[] = []): string => {
   const rels = [`<Relationship Id="rId1" Type="${NS.r}/styles" Target="styles.xml"/>`,
     ...(hasLists ? [`<Relationship Id="rId2" Type="${NS.r}/numbering" Target="numbering.xml"/>`] : []),
     ...(hasHeader ? [`<Relationship Id="rIdHeader" Type="${NS.r}/header" Target="header1.xml"/>`] : []),
     ...(hasFooter ? [`<Relationship Id="rIdFooter" Type="${NS.r}/footer" Target="footer1.xml"/>`] : []),
     ...hyperlinks.map(l => `<Relationship Id="${l.rId}" Type="${NS.r}/hyperlink" Target="${escapeXml(l.url)}" TargetMode="External"/>`),
-    ...images.map((img, i) => `<Relationship Id="${img.rId}" Type="${NS.r}/image" Target="media/image${imageOffset + i + 1}.${img.ext}"/>`)
+    ...images.map((img, i) => `<Relationship Id="${img.rId}" Type="${NS.r}/image" Target="media/image${imageOffset + i + 1}.${img.ext}"/>`),
+    ...externalImages.map(img => `<Relationship Id="${img.rId}" Type="${NS.r}/image" Target="${escapeXml(img.url)}" TargetMode="External"/>`)
   ].join('')
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="${NS.rel}">${rels}</Relationships>`
 }
@@ -739,11 +796,11 @@ export function docx(): DOCXBuilder {
 const ODT_MIMETYPE = 'application/vnd.oasis.opendocument.text'
 
 const generateOdtManifest = (images: { ext: string }[]): string => {
-  const imgEntries = images.map((img, i) => `<manifest:file-entry manifest:full-path="Pictures/image${i + 1}.${img.ext}" manifest:media-type="${img.ext === 'jpeg' ? 'image/jpeg' : img.ext === 'gif' ? 'image/gif' : 'image/png'}"/>`).join('')
+  const imgEntries = images.map((img, i) => `<manifest:file-entry manifest:full-path="Pictures/image${i + 1}.${img.ext}" manifest:media-type="${imageMimeType(img.ext)}"/>`).join('')
   return `<?xml version="1.0" encoding="UTF-8"?><manifest:manifest xmlns:manifest="${NS.manifest}" manifest:version="1.2"><manifest:file-entry manifest:full-path="/" manifest:media-type="application/vnd.oasis.opendocument.text"/><manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="styles.xml" manifest:media-type="text/xml"/>${imgEntries}</manifest:manifest>`
 }
 
-type OdtStyleAcc = { styles: string[]; counter: number }
+type OdtStyleAcc = { styles: string[]; counter: number; imageIndexes?: Map<string, number> }
 
 const buildOdtTextProps = (opts?: TextOptions, size?: number): string => {
   const font = opts?.code ? COURIER : opts?.font
@@ -768,14 +825,19 @@ const buildOdtStyle = (name: string, family: 'paragraph' | 'text', opts?: TextOp
 const needsTextStyle = (opts?: TextOptions): boolean =>
   !!(opts?.bold || opts?.italic || opts?.code || opts?.underline || opts?.strikethrough || opts?.color)
 
-const buildOdtRuns = (runs: TextRun[], acc: OdtStyleAcc): string =>
+const buildOdtRuns = (runs: RenderRun[], acc: OdtStyleAcc): string =>
   runs.map(run => {
+    if (run.image) {
+      const name = escapeXml(run.image.alt || 'Image')
+      return `<draw:frame draw:name="${name}" svg:width="2.54cm" svg:height="2.54cm"><draw:image xlink:href="${escapeXml(run.image.src)}"/></draw:frame>`
+    }
+    const text = run.link ? `<text:a xlink:href="${escapeXml(run.link)}">${escapeXml(run.text)}</text:a>` : escapeXml(run.text)
     if (needsTextStyle(run.opts)) {
       const styleName = `T${++acc.counter}`
       acc.styles.push(buildOdtStyle(styleName, 'text', run.opts))
-      return `<text:span text:style-name="${styleName}">${escapeXml(run.text)}</text:span>`
+      return `<text:span text:style-name="${styleName}">${text}</text:span>`
     }
-    return escapeXml(run.text)
+    return text
   }).join('')
 
 const buildOdtList = (items: ListItem[], ordered: boolean, acc: OdtStyleAcc): string => {
@@ -788,9 +850,9 @@ const buildOdtList = (items: ListItem[], ordered: boolean, acc: OdtStyleAcc): st
 const elementToOdt = (el: DocElement, acc: OdtStyleAcc, imageOffset: number): string => {
   switch (el.type) {
     case 'heading':
-      return `<text:h text:style-name="Heading${el.level}" text:outline-level="${el.level}">${escapeXml(el.text)}</text:h>`
+      return `<text:h text:style-name="Heading${el.level}" text:outline-level="${el.level}">${el.runs ? buildOdtRuns(el.runs, acc) : escapeXml(el.text)}</text:h>`
     case 'paragraph': {
-      if (el.opts?.bold || el.opts?.italic || el.opts?.color || el.opts?.align || el.opts?.font || el.opts?.underline) {
+      if (el.opts && Object.keys(el.opts).length > 0) {
         const sn = `P${++acc.counter}`
         acc.styles.push(buildOdtStyle(sn, 'paragraph', el.opts))
         return `<text:p text:style-name="${sn}">${escapeXml(el.text)}</text:p>`
@@ -811,7 +873,7 @@ const elementToOdt = (el: DocElement, acc: OdtStyleAcc, imageOffset: number): st
     case 'link':
       return `<text:p><text:a xlink:href="${escapeXml(el.url)}" xmlns:xlink="${NS.xlink}">${escapeXml(el.text)}</text:a></text:p>`
     case 'image': {
-      const idx = imageOffset + 1
+      const idx = acc.imageIndexes?.get(el.rId) ?? imageOffset + 1
       const wCm = (el.opts.width * 2.54).toFixed(3), hCm = (el.opts.height * 2.54).toFixed(3)
       return `<text:p><draw:frame draw:name="Image${idx}" svg:width="${wCm}cm" svg:height="${hCm}cm" xmlns:draw="${NS.draw}" xmlns:svg="${NS.svg}"><draw:image xlink:href="Pictures/image${idx}.${detectImageType(el.data)}" xmlns:xlink="${NS.xlink}"/></draw:frame></text:p>`
     }
@@ -831,14 +893,14 @@ const elementToOdt = (el: DocElement, acc: OdtStyleAcc, imageOffset: number): st
   }
 }
 
-const generateOdtContent = (elements: DocElement[], imageOffset = 0): string => {
-  const acc: OdtStyleAcc = { styles: [], counter: 0 }
-  const body = elements.map(el => elementToOdt(el, acc, imageOffset)).join('')
+const generateOdtContent = (elements: DocElement[], imageIndexes?: Map<string, number>): string => {
+  const acc: OdtStyleAcc = { styles: [], counter: 0, imageIndexes }
+  const body = elements.map(el => elementToOdt(el, acc, 0)).join('')
   const autoStyles = acc.styles.length > 0 ? `<office:automatic-styles>${acc.styles.join('')}</office:automatic-styles>` : ''
-  return `<?xml version="1.0" encoding="UTF-8"?>\n<office:document-content xmlns:office="${NS.office}" xmlns:text="${NS.text}" xmlns:style="${NS.style}" xmlns:fo="${NS.fo}" office:version="1.2">\n${autoStyles}\n<office:body>\n<office:text>\n${body}\n</office:text>\n</office:body>\n</office:document-content>`
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<office:document-content xmlns:office="${NS.office}" xmlns:text="${NS.text}" xmlns:style="${NS.style}" xmlns:fo="${NS.fo}" xmlns:table="${NS.table}" xmlns:draw="${NS.draw}" xmlns:svg="${NS.svg}" xmlns:xlink="${NS.xlink}" office:version="1.2">\n${autoStyles}\n<office:body>\n<office:text>\n${body}\n</office:text>\n</office:body>\n</office:document-content>`
 }
 
-const generateOdtStyles = (headerElements?: DocElement[], footerElements?: DocElement[]): string => {
+const generateOdtStyles = (headerElements?: DocElement[], footerElements?: DocElement[], imageIndexes?: Map<string, number>): string => {
   const headings = [1, 2, 3, 4, 5, 6].map(i => {
     const sizes = { 1: '24pt', 2: '18pt', 3: '14pt', 4: '12pt', 5: '10pt', 6: '9pt' } as Record<number, string>
     return `<style:style style:name="Heading${i}" style:family="paragraph"><style:text-properties fo:font-size="${sizes[i]}" fo:font-weight="bold"/></style:style>`
@@ -846,12 +908,13 @@ const generateOdtStyles = (headerElements?: DocElement[], footerElements?: DocEl
   const hasMaster = headerElements || footerElements
   let masterStyles = ''
   if (hasMaster) {
-    const acc: OdtStyleAcc = { styles: [], counter: 1000 }
+    const acc: OdtStyleAcc = { styles: [], counter: 1000, imageIndexes }
     const hdr = headerElements ? `<style:header>${headerElements.map(el => elementToOdt(el, acc, 0)).join('')}</style:header>` : ''
     const ftr = footerElements ? `<style:footer>${footerElements.map(el => elementToOdt(el, acc, 0)).join('')}</style:footer>` : ''
-    masterStyles = `<office:master-styles><style:master-page style:name="Standard" style:page-layout-name="pm1">${hdr}${ftr}</style:master-page></office:master-styles>`
+    masterStyles = `<office:automatic-styles><style:page-layout style:name="pm1"><style:page-layout-properties fo:page-width="21cm" fo:page-height="29.7cm" style:print-orientation="portrait"/></style:page-layout>${acc.styles.join('')}</office:automatic-styles><office:master-styles><style:master-page style:name="Standard" style:page-layout-name="pm1">${hdr}${ftr}</style:master-page></office:master-styles>`
   }
-  return `<?xml version="1.0" encoding="UTF-8"?><office:document-styles xmlns:office="${NS.office}" xmlns:style="${NS.style}" xmlns:fo="${NS.fo}" xmlns:text="${NS.text}" office:version="1.2"><office:styles><style:style style:name="Standard" style:family="paragraph"/>${headings}</office:styles>${masterStyles}</office:document-styles>`
+  const listStyles = `<text:list-style style:name="List_20_1">${Array.from({ length: 10 }, (_, i) => `<text:list-level-style-bullet text:level="${i + 1}" text:bullet-char="${BULLET_CHARS[i % BULLET_CHARS.length]}"/>`).join('')}</text:list-style><text:list-style style:name="Numbering_20_1">${Array.from({ length: 10 }, (_, i) => `<text:list-level-style-number text:level="${i + 1}" style:num-format="1" style:num-suffix="."/>`).join('')}</text:list-style>`
+  return `<?xml version="1.0" encoding="UTF-8"?><office:document-styles xmlns:office="${NS.office}" xmlns:style="${NS.style}" xmlns:fo="${NS.fo}" xmlns:text="${NS.text}" xmlns:table="${NS.table}" xmlns:draw="${NS.draw}" xmlns:svg="${NS.svg}" xmlns:xlink="${NS.xlink}" office:version="1.2"><office:styles><style:style style:name="Standard" style:family="paragraph"/>${headings}${listStyles}</office:styles>${masterStyles}</office:document-styles>`
 }
 
 /**
@@ -870,11 +933,12 @@ export function odt(): ODTBuilder {
     build() {
       const enc = new TextEncoder()
       const allImages = [...ctx.images, ...headerCtx.images, ...footerCtx.images]
+      const imageIndexes = new Map(allImages.map((img, i) => [img.rId, i + 1]))
       return createZip([
-        { name: 'mimetype', data: enc.encode(ODT_MIMETYPE) },
+        { name: 'mimetype', data: enc.encode(ODT_MIMETYPE), store: true },
         { name: 'META-INF/manifest.xml', data: enc.encode(generateOdtManifest(allImages)) },
-        { name: 'content.xml', data: enc.encode(generateOdtContent(ctx.elements)) },
-        { name: 'styles.xml', data: enc.encode(generateOdtStyles(hasHeader ? headerCtx.elements : undefined, hasFooter ? footerCtx.elements : undefined)) },
+        { name: 'content.xml', data: enc.encode(generateOdtContent(ctx.elements, imageIndexes)) },
+        { name: 'styles.xml', data: enc.encode(generateOdtStyles(hasHeader ? headerCtx.elements : undefined, hasFooter ? footerCtx.elements : undefined, imageIndexes)) },
         ...allImages.map((img, i) => ({ name: `Pictures/image${i + 1}.${img.ext}`, data: img.data }))
       ])
     }
@@ -888,12 +952,13 @@ export function markdownToDocx(md: string): Uint8Array {
   const docPrIdCounter = { value: 1 }
   const mainCtx: BuildContext = { elements: [], hyperlinks: [], images: [], nextRId: 10, nextDocPrId: docPrIdCounter }
   mainCtx.elements.push(...parseMarkdownToElements(md))
+  const relationships = prepareMarkdownRelationships(mainCtx.elements)
   const enc = new TextEncoder()
   const hasLists = mainCtx.elements.some(el => el.type === 'list' || el.type === 'richList')
   const files: ZipEntry[] = [
     { name: '[Content_Types].xml', data: enc.encode(generateDocxContentTypes(hasLists, false, false, [])) },
     { name: '_rels/.rels', data: enc.encode(DOCX_RELS) },
-    { name: 'word/_rels/document.xml.rels', data: enc.encode(generateDocxRels(hasLists, false, false, [], [], 0)) },
+    { name: 'word/_rels/document.xml.rels', data: enc.encode(generateDocxRels(hasLists, false, false, relationships.hyperlinks, [], 0, relationships.images)) },
     { name: 'word/document.xml', data: enc.encode(generateDocxDocument(mainCtx.elements, undefined, undefined)) },
     { name: 'word/styles.xml', data: enc.encode(generateDocxStyles()) },
     ...(hasLists ? [{ name: 'word/numbering.xml', data: enc.encode(generateDocxNumbering()) }] : [])
@@ -904,7 +969,7 @@ export function markdownToDocx(md: string): Uint8Array {
 export function markdownToOdt(md: string): Uint8Array {
   const enc = new TextEncoder()
   return createZip([
-    { name: 'mimetype', data: enc.encode(ODT_MIMETYPE) },
+    { name: 'mimetype', data: enc.encode(ODT_MIMETYPE), store: true },
     { name: 'META-INF/manifest.xml', data: enc.encode(generateOdtManifest([])) },
     { name: 'content.xml', data: enc.encode(generateOdtContent(parseMarkdownToElements(md))) },
     { name: 'styles.xml', data: enc.encode(generateOdtStyles()) }

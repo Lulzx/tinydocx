@@ -25,6 +25,28 @@ const readZip = (zip: Uint8Array): string => {
   return parts.join('\n')
 }
 
+/** Extract a single ZIP entry by exact name. */
+const readZipEntry = (zip: Uint8Array, wanted: string): string => {
+  const view = new DataView(zip.buffer, zip.byteOffset, zip.byteLength)
+  const dec = new TextDecoder()
+  let pos = 0
+  while (pos + 30 <= zip.length && view.getUint32(pos, true) === 0x04034b50) {
+    const method = view.getUint16(pos + 8, true)
+    const compressedSize = view.getUint32(pos + 18, true)
+    const nameLen = view.getUint16(pos + 26, true)
+    const extraLen = view.getUint16(pos + 28, true)
+    const name = dec.decode(zip.subarray(pos + 30, pos + 30 + nameLen))
+    const dataStart = pos + 30 + nameLen + extraLen
+    const raw = zip.subarray(dataStart, dataStart + compressedSize)
+    if (name === wanted) return dec.decode(method === 8 ? inflateRawSync(raw) : raw)
+    pos = dataStart + compressedSize
+  }
+  throw new Error(`ZIP entry not found: ${wanted}`)
+}
+
+const firstZipMethod = (zip: Uint8Array): number =>
+  new DataView(zip.buffer, zip.byteOffset, zip.byteLength).getUint16(8, true)
+
 describe('docx', () => {
   test('creates valid ZIP archive', () => {
     const doc = docx()
@@ -380,6 +402,7 @@ describe('docx', () => {
     doc.content((ctx) => ctx.image(webpBytes, { width: 1, height: 1 }))
     const str = readZip(doc.build())
     expect(str).toContain('image1.webp')
+    expect(str).toContain('image/webp')
   })
 
   test('renders multiple images', () => {
@@ -621,6 +644,7 @@ describe('odt', () => {
     const str = readZip(doc.build())
     expect(str).toContain('mimetype')
     expect(str).toContain('application/vnd.oasis.opendocument.text')
+    expect(firstZipMethod(doc.build())).toBe(0)
   })
 
   test('includes required ODT files', () => {
@@ -819,6 +843,33 @@ describe('odt', () => {
     expect(str).toContain('manifest:full-path="Pictures/image1.png"')
   })
 
+  test('multiple images reference their matching files', () => {
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
+    const jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0])
+    const doc = odt().content(ctx => {
+      ctx.image(png, { width: 1, height: 1 })
+      ctx.image(jpeg, { width: 1, height: 1 })
+    })
+    const content = readZipEntry(doc.build(), 'content.xml')
+    expect(content).toContain('Pictures/image1.png')
+    expect(content).toContain('Pictures/image2.jpeg')
+  })
+
+  test('declares WebP with the correct media type', () => {
+    const webp = new Uint8Array([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50])
+    const manifest = readZipEntry(odt().content(ctx => ctx.image(webp, { width: 1, height: 1 })).build(), 'META-INF/manifest.xml')
+    expect(manifest).toContain('manifest:media-type="image/webp"')
+  })
+
+  test('defines referenced list styles', () => {
+    const zip = odt().content(ctx => ctx.list(['Bullet'])).build()
+    const content = readZipEntry(zip, 'content.xml')
+    const styles = readZipEntry(zip, 'styles.xml')
+    expect(content).toContain('text:style-name="List_20_1"')
+    expect(styles).toContain('style:name="List_20_1"')
+    expect(styles).toContain('style:name="Numbering_20_1"')
+  })
+
   test('renders page number', () => {
     const doc = odt()
     doc.content((ctx) => ctx.pageNumber())
@@ -838,6 +889,18 @@ describe('odt', () => {
     expect(str).toContain('style:footer')
     expect(str).toContain('Footer Text')
     expect(str).toContain('style:master-page')
+  })
+
+  test('defines styles referenced by formatted headers and footers', () => {
+    const zip = odt()
+      .header(ctx => ctx.paragraph('Bold header', { bold: true }))
+      .footer(ctx => ctx.paragraph('Italic footer', { italic: true }))
+      .build()
+    const styles = readZipEntry(zip, 'styles.xml')
+    expect(styles).toContain('text:style-name="P1001"')
+    expect(styles).toContain('style:name="P1001"')
+    expect(styles).toContain('fo:font-weight="bold"')
+    expect(styles).toContain('fo:font-style="italic"')
   })
 
   test('supports header chaining', () => {
@@ -982,6 +1045,33 @@ Conclusion.`
     const str = readZip(markdownToDocx('- Item A\n- Item B'))
     expect(str).toContain('word/numbering.xml')
   })
+
+  test('converts inline links with a relationship', () => {
+    const zip = markdownToDocx('Visit [Example](https://example.com).')
+    const document = readZipEntry(zip, 'word/document.xml')
+    const rels = readZipEntry(zip, 'word/_rels/document.xml.rels')
+    expect(document).toContain('<w:hyperlink r:id="rId10">')
+    expect(rels).toContain('Id="rId10"')
+    expect(rels).toContain('Target="https://example.com"')
+  })
+
+  test('preserves inline links in headings', () => {
+    const zip = markdownToDocx('# [Linked heading](https://example.com/heading)')
+    const document = readZipEntry(zip, 'word/document.xml')
+    const rels = readZipEntry(zip, 'word/_rels/document.xml.rels')
+    expect(document).toContain('<w:hyperlink r:id="rId10">')
+    expect(rels).toContain('Target="https://example.com/heading"')
+  })
+
+  test('converts Markdown images as external image relationships', () => {
+    const zip = markdownToDocx('![Logo](https://example.com/logo.png)')
+    const document = readZipEntry(zip, 'word/document.xml')
+    const rels = readZipEntry(zip, 'word/_rels/document.xml.rels')
+    expect(document).toContain('r:link="rId10"')
+    expect(document).toContain('name="Logo"')
+    expect(rels).toContain('Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"')
+    expect(rels).toContain('Target="https://example.com/logo.png" TargetMode="External"')
+  })
 })
 
 describe('markdownToOdt', () => {
@@ -1014,5 +1104,17 @@ describe('markdownToOdt', () => {
     const bytes = markdownToOdt('')
     expect(bytes).toBeInstanceOf(Uint8Array)
     expect(bytes.length).toBeGreaterThan(0)
+  })
+
+  test('converts inline links and images', () => {
+    const content = readZipEntry(markdownToOdt('[Example](https://example.com) ![Logo](https://example.com/logo.png)'), 'content.xml')
+    expect(content).toContain('<text:a xlink:href="https://example.com">Example</text:a>')
+    expect(content).toContain('<draw:image xlink:href="https://example.com/logo.png"/>')
+  })
+
+  test('preserves inline links in headings', () => {
+    const content = readZipEntry(markdownToOdt('# [Linked heading](https://example.com/heading)'), 'content.xml')
+    expect(content).toContain('<text:h')
+    expect(content).toContain('<text:a xlink:href="https://example.com/heading">Linked heading</text:a>')
   })
 })
