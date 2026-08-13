@@ -1,6 +1,6 @@
 {
   "name": "tinydocx",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Minimal DOCX/ODT creation library with tables, images, lists, headers/footers. Zero dependencies.",
   "type": "module",
   "main": "./dist/index.js",

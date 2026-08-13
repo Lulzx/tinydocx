@@ -801,6 +801,19 @@ describe('odt', () => {
     expect(str).toContain('D')
   })
 
+  test('declares every table column for LibreOffice compatibility', () => {
+    const doc = odt()
+    doc.content((ctx) => ctx.table([
+      ['A', 'B', 'C'],
+      ['D', 'E', 'F']
+    ]))
+    const content = readZipEntry(doc.build(), 'content.xml')
+    expect(content.match(/<table:table-column table:style-name=/g)).toHaveLength(3)
+    expect(content.indexOf('<table:table-column ')).toBeLessThan(content.indexOf('<table:table-row>'))
+    expect(content).toContain('fo:border="0.5pt solid #000000"')
+    expect(content).toContain('fo:padding="0.08cm"')
+  })
+
   test('renders hyperlink', () => {
     const doc = odt()
     doc.content((ctx) => ctx.link('Click here', 'https://example.com'))
@@ -991,6 +1004,16 @@ describe('markdownToDocx', () => {
     expect(str).toContain('This is another.')
   })
 
+  test('preserves spaces around inline formatting runs', () => {
+    const document = readZipEntry(
+      markdownToDocx('This is **bold**, *italic*, and ~~struck~~ text.'),
+      'word/document.xml'
+    )
+    expect(document).toContain('<w:t xml:space="preserve">This is </w:t>')
+    expect(document).toContain('<w:t xml:space="preserve">, </w:t>')
+    expect(document).toContain('<w:t xml:space="preserve"> text.</w:t>')
+  })
+
   test('handles empty input', () => {
     const bytes = markdownToDocx('')
     expect(bytes).toBeInstanceOf(Uint8Array)
@@ -1098,6 +1121,13 @@ describe('markdownToOdt', () => {
     const str = readZip(markdownToOdt('1. First\n2. Second'))
     expect(str).toContain('First')
     expect(str).toContain('Second')
+  })
+
+  test('declares columns for Markdown tables', () => {
+    const content = readZipEntry(markdownToOdt('| A | B |\n|---|---|\n| C | D |'), 'content.xml')
+    expect(content.match(/<table:table-column table:style-name=/g)).toHaveLength(2)
+    expect(content).toContain('<text:p>A</text:p>')
+    expect(content).toContain('<text:p>D</text:p>')
   })
 
   test('handles empty input', () => {

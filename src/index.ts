@@ -622,10 +622,13 @@ const buildDocxExternalImage = (run: RenderRun): string => {
   return `<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0" xmlns:wp="${NS.wp}"><wp:extent cx="${cx}" cy="${cy}"/><wp:docPr id="${id}" name="${name}"/><a:graphic xmlns:a="${NS.a}"><a:graphicData uri="${NS.pic}"><pic:pic xmlns:pic="${NS.pic}"><pic:nvPicPr><pic:cNvPr id="${id}" name="${name}"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:link="${run.rId}" xmlns:r="${NS.r}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>`
 }
 
+const buildDocxText = (text: string): string =>
+  `<w:t${/^\s|\s$/.test(text) ? ' xml:space="preserve"' : ''}>${escapeXml(text)}</w:t>`
+
 const buildDocxRuns = (runs: RenderRun[]): string =>
   runs.map(run => {
     if (run.image && run.rId) return buildDocxExternalImage(run)
-    const xml = `<w:r>${buildDocxRunProps(run.opts)}<w:t>${escapeXml(run.text)}</w:t></w:r>`
+    const xml = `<w:r>${buildDocxRunProps(run.opts)}${buildDocxText(run.text)}</w:r>`
     return run.link && run.rId ? `<w:hyperlink r:id="${run.rId}">${xml}</w:hyperlink>` : xml
   }).join('')
 
@@ -847,6 +850,26 @@ const buildOdtList = (items: ListItem[], ordered: boolean, acc: OdtStyleAcc): st
   return `<text:list text:style-name="${ordered ? 'Numbering_20_1' : 'List_20_1'}">${listItems}</text:list>`
 }
 
+const buildOdtTable = <T>(rows: T[][], renderCell: (cell: T) => string, acc: OdtStyleAcc, opts?: TableOptions): string => {
+  const columnCount = Math.max(0, ...rows.map(row => row.length))
+  const tableStyle = `Table${++acc.counter}`
+  const cellStyle = `TableCell${acc.counter}`
+  acc.styles.push(`<style:style style:name="${tableStyle}" style:family="table"><style:table-properties style:width="17cm" table:align="left"/></style:style>`)
+  acc.styles.push(`<style:style style:name="${cellStyle}" style:family="table-cell"><style:table-cell-properties fo:border="0.5pt solid #000000" fo:padding="0.08cm"/></style:style>`)
+  const weights = Array.from({ length: columnCount }, (_, i) => opts?.colWidths?.[i] ?? 1)
+  const totalWeight = weights.reduce((sum, width) => sum + width, 0) || 1
+  const columns = weights.map((weight, i) => {
+    const columnStyle = `${tableStyle}Col${i + 1}`
+    const width = (17 * weight / totalWeight).toFixed(3)
+    acc.styles.push(`<style:style style:name="${columnStyle}" style:family="table-column"><style:table-column-properties style:column-width="${width}cm"/></style:style>`)
+    return `<table:table-column table:style-name="${columnStyle}"/>`
+  }).join('')
+  const tableRows = rows.map(row =>
+    `<table:table-row>${row.map(cell => `<table:table-cell table:style-name="${cellStyle}"><text:p>${renderCell(cell)}</text:p></table:table-cell>`).join('')}</table:table-row>`
+  ).join('')
+  return `<table:table table:style-name="${tableStyle}" xmlns:table="${NS.table}">${columns}${tableRows}</table:table>`
+}
+
 const elementToOdt = (el: DocElement, acc: OdtStyleAcc, imageOffset: number): string => {
   switch (el.type) {
     case 'heading':
@@ -869,7 +892,7 @@ const elementToOdt = (el: DocElement, acc: OdtStyleAcc, imageOffset: number): st
     case 'list':
       return `<text:list text:style-name="${el.ordered ? 'Numbering_20_1' : 'List_20_1'}">${el.items.map(item => `<text:list-item><text:p text:style-name="Standard">${escapeXml(item)}</text:p></text:list-item>`).join('')}</text:list>`
     case 'table':
-      return `<table:table xmlns:table="${NS.table}">${el.rows.map(row => `<table:table-row>${row.map(cell => `<table:table-cell><text:p>${escapeXml(cell)}</text:p></table:table-cell>`).join('')}</table:table-row>`).join('')}</table:table>`
+      return buildOdtTable(el.rows, escapeXml, acc, el.opts)
     case 'link':
       return `<text:p><text:a xlink:href="${escapeXml(el.url)}" xmlns:xlink="${NS.xlink}">${escapeXml(el.text)}</text:a></text:p>`
     case 'image': {
@@ -883,7 +906,7 @@ const elementToOdt = (el: DocElement, acc: OdtStyleAcc, imageOffset: number): st
       return `<text:p text:style-name="Standard">${buildOdtRuns(el.runs, acc)}</text:p>`
     case 'richList': return buildOdtList(el.items, el.ordered, acc)
     case 'richTable':
-      return `<table:table xmlns:table="${NS.table}">${el.rows.map(row => `<table:table-row>${row.map(cell => `<table:table-cell><text:p>${buildOdtRuns(cell, acc)}</text:p></table:table-cell>`).join('')}</table:table-row>`).join('')}</table:table>`
+      return buildOdtTable(el.rows, cell => buildOdtRuns(cell, acc), acc, el.opts)
     case 'blockquote': return el.elements.map(child => elementToOdt(child, acc, imageOffset)).join('')
     case 'codeBlock': {
       const sn = `P${++acc.counter}`
